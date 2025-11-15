@@ -278,3 +278,230 @@ if run:
                     st.write(a)
         else:
             st.warning("No matches found. Try broader keywords like 'frozen', 'snacks', 'milk'.")
+
+# ------------------- LLM + Rich-Visualization helpers (Hugging Face) -------------------
+import json
+import requests
+import plotly.express as px
+import plotly.graph_objects as go
+from io import BytesIO
+import base64
+
+st.sidebar.markdown("----")
+st.sidebar.subheader("LLM options (optional)")
+HF_API_KEY = st.sidebar.text_input("Hugging Face API key (optional)", type="password", help="If provided, app will ask HF LLM to summarise results and suggest chart types.")
+HF_MODEL = st.sidebar.selectbox("HF model", ["google/flan-t5-large","bigscience/bloomz-560m","tiiuae/falcon-7b-instruct"], index=0)
+
+def call_hf_llm(prompt, model, token, max_tokens=512, timeout=30):
+    """
+    Simple HF Inference call using the Inference API endpoint.
+    Returns the generated text (string) or raises.
+    """
+    if not token:
+        return None
+    url = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_tokens, "temperature": 0.0}}
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    # The Inference API sometimes returns a list of dicts with "generated_text"
+    if isinstance(data, list):
+        txt = data[0].get("generated_text") if isinstance(data[0], dict) else str(data[0])
+    elif isinstance(data, dict) and "generated_text" in data:
+        txt = data["generated_text"]
+    else:
+        # fallback: convert response to text
+        txt = json.dumps(data)
+    return txt
+
+def make_llm_prompt_for_agg(question, short_context):
+    """
+    Produce a short instruction for the LLM: we already computed exact numbers locally,
+    so LLM should *explain* the results and produce a small JSON with keys:
+      - answer_text
+      - chart_type (bar|line|pie|sunburst|none)
+      - chart_spec: {"table":..., "x":..., "y":..., "agg": "count|sum|avg", "top_k":10}
+      - followups: list of suggested follow-up questions (1-3)
+    """
+    prompt = f\"\"\"You are a helpful assistant. Use ONLY the context below (exact numbers / summaries). The user asked: \"{question}\".
+
+Context (short):
+{short_context}
+
+Return a JSON only (no extra commentary) with keys:
+- answer_text: a 1-2 sentence natural explanation of the exact results.
+- chart_type: one of ["bar","line","pie","sunburst","none"].
+- chart_spec: an object with fields: table (e.g. "order_products__prior"), x (column name), y (column name or "count"), agg ("count"|"sum"|"avg"), top_k (integer).
+- followups: list of 0..3 short suggested follow-up queries.
+
+Example:
+{{"answer_text":"...","chart_type":"bar","chart_spec":{{"table":"order_products__prior","x":"product_name","y":"product_id","agg":"count","top_k":10}},"followups":["..."]}}
+\"\"\"
+    return prompt
+
+def compute_chart_df_from_spec(spec, dfs):
+    """
+    Given chart_spec and our loaded dfs dict, compute an exact DataFrame to plot.
+    Returns a pandas DataFrame with columns [x,y] or None on error.
+    """
+    try:
+        table = spec.get("table")
+        x = spec.get("x")
+        y = spec.get("y")
+        agg = spec.get("agg")
+        top_k = int(spec.get("top_k", 10))
+        # only support a small set of safe ops
+        if table == "order_products__prior" and agg == "count" and y in ("product_id","*"):
+            # count product_id occurrences and optionally join to product_name
+            prior = dfs.get("prior")
+            products = dfs.get("products")
+            counts = prior[x if x in prior.columns else "product_id"].value_counts().head(top_k)
+            df = counts.rename_axis("val").reset_index(name="count")
+            # if x is product_id, attempt to join product_name
+            if x == "product_id" and products is not None:
+                prod_idx = products.set_index("product_id")
+                df["name"] = df["val"].apply(lambda pid: prod_idx.loc[pid]["product_name"] if pid in prod_idx.index else str(pid))
+                df = df.rename(columns={"name":"x","count":"y"})[["x","y"]]
+            elif x in prior.columns:
+                df = df.rename(columns={"val":"x","count":"y"})[["x","y"]]
+            else:
+                # fallback: return value as x
+                df = df.rename(columns={"val":"x","count":"y"})[["x","y"]]
+            return df
+        # support orders by day/hour
+        if table == "orders" and x in ("order_dow","order_hour_of_day") and agg == "count":
+            orders = dfs.get("orders")
+            counts = orders[x].value_counts().sort_index()
+            df = counts.rename_axis(x).reset_index(name="count").rename(columns={x:"x","count":"y"})
+            return df.head(top_k)
+    except Exception as e:
+        print("compute_chart_df_from_spec error:", e)
+    return None
+
+def render_chart_from_df(df, chart_type, title="Chart"):
+    """
+    Render various chart types using Plotly and return the component (st.plotly_chart).
+    """
+    if df is None or df.empty:
+        st.info("No data available for chart.")
+        return
+    if chart_type == "bar":
+        fig = px.bar(df, x="x", y="y", title=title)
+    elif chart_type == "line":
+        fig = px.line(df, x="x", y="y", title=title)
+    elif chart_type == "pie":
+        if "y" not in df.columns:
+            st.info("Pie requires a 'y' column.")
+            return
+        fig = px.pie(df, names="x", values="y", title=title)
+    elif chart_type == "sunburst":
+        # requires hierarchical columns; attempt simple product->aisle if present
+        if "x" in df.columns and "y" in df.columns:
+            # If df has 'x' with ' / ' splitable categories, use that
+            # fallback: simple pie
+            fig = px.sunburst(df, names="x", values="y", title=title)
+        else:
+            fig = px.pie(df, names="x", values="y", title=title)
+    else:
+        st.info("Chart type not supported; showing table instead.")
+        st.dataframe(df)
+        return
+    st.plotly_chart(fig, use_container_width=True)
+
+def show_retrieval_table(results_list):
+    """
+    Accept list of dicts {text, metadata, score} and render as a nice table + download.
+    """
+    if not results_list:
+        st.info("No retrieval results.")
+        return
+    # build DataFrame
+    rows = []
+    for r in results_list:
+        rows.append({"text": r.get("text"), "table": r.get("metadata",{}).get("table"), "row_id": r.get("metadata",{}).get("row_id"), "score": r.get("score", None)})
+    df = pd.DataFrame(rows)
+    st.dataframe(df.head(200))
+    # download csv
+    csv = df.to_csv(index=False).encode("utf-8")
+    b64 = base64.b64encode(csv).decode()
+    href = f'<a href="data:text/csv;base64,{b64}" download="retrieval.csv">Download retrieval results (CSV)</a>'
+    st.markdown(href, unsafe_allow_html=True)
+
+# ------------------ End of LLM + Visualization helpers -------------------
+
+# integrate LLM step AFTER aggregation or retrieval handling
+# place a small UI: "Ask LLM to summarize & suggest visual"
+if run and HF_API_KEY:
+    try:
+        # build short context summary for the LLM
+        # For aggregation: prefer to show a short top-k or stats; for retrieval: show top few retrieval results
+        short_context = ""
+        if intent == "aggregation":
+            # attempt to compute a local short context summary from prior tables
+            try:
+                # compute a small top-6 sample if top-products handler ran
+                top_df = None
+                if "product" in ql or "most" in ql or "top" in ql:
+                    top_df = agg_top_products(prior, products, top_k=6)
+                elif "least" in ql:
+                    top_df = agg_least_ordered(prior, products, top_k=6)
+                if top_df is not None:
+                    # convert to simple json table
+                    short_context = top_df.to_dict(orient="records")
+                else:
+                    short_context = {"note":"no top sample available"}
+            except Exception as e:
+                short_context = {"error":"could not compute short context", "e": str(e)}
+        else:
+            # retrieval: show first 6 retrieval result texts if available
+            try:
+                # reuse earlier 'results' if present in memory; else do quick product name search
+                quick = []
+                if 'results' in locals() and isinstance(results, list) and results:
+                    quick = [r.get("text") for r in results[:8]]
+                else:
+                    # quick local product search
+                    mask = products["product_name"].str.lower().str.contains(ql, na=False)
+                    quick = products[mask].head(6)["product_name"].tolist()
+                short_context = {"retrieved_examples": quick}
+            except Exception as e:
+                short_context = {"error":"retrieval short context failed","e":str(e)}
+
+        prompt = make_llm_prompt_for_agg(ql_raw, json.dumps(short_context, ensure_ascii=False, indent=0))
+        hf_out = call_hf_llm(prompt, HF_MODEL, HF_API_KEY)
+        if hf_out:
+            # attempt to extract JSON block
+            m = None
+            try:
+                m = json.loads(hf_out)
+            except Exception:
+                # try to find first JSON-like substring
+                import re as _re
+                mm = _re.search(r"\{.*\}", hf_out, flags=_re.DOTALL)
+                if mm:
+                    try:
+                        m = json.loads(mm.group(0))
+                    except Exception:
+                        m = None
+            if m:
+                st.subheader("LLM summary & visualization suggestion")
+                st.write(m.get("answer_text","(no answer_text)"))
+                chart_type = m.get("chart_type","none")
+                chart_spec = m.get("chart_spec",{})
+                # compute chart df (locally exact) and render
+                chart_df = compute_chart_df_from_spec(chart_spec, {"prior":prior,"products":products,"orders":orders})
+                render_chart_from_df(chart_df, chart_type, title="LLM suggested chart")
+                # followups
+                if "followups" in m:
+                    st.markdown("**Follow-up suggestions:**")
+                    for f in m["followups"][:3]:
+                        st.write("- "+f)
+            else:
+                st.warning("LLM returned text but JSON parse failed — showing raw output:")
+                st.code(hf_out[:2000])
+    except requests.HTTPError as he:
+        st.error(f"Hugging Face API error: {he} — check model name and HF token.")
+    except Exception as e:
+        st.error(f"LLM step failed: {e}")
+
