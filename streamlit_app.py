@@ -324,20 +324,27 @@ def make_llm_prompt_for_agg(question, short_context):
       - chart_spec: {"table":..., "x":..., "y":..., "agg": "count|sum|avg", "top_k":10}
       - followups: list of suggested follow-up questions (1-3)
     """
-    prompt = f\"\"\"You are a helpful assistant. Use ONLY the context below (exact numbers / summaries). The user asked: \"{question}\".
+    prompt = f"""
+You are a helpful assistant helping interpret analytical results.
+Use ONLY the context below — do not guess values outside the context.
+Context:
+{json.dumps(context, indent=2)}
 
-Context (short):
-{short_context}
+The user asked: "{question}"
 
-Return a JSON only (no extra commentary) with keys:
-- answer_text: a 1-2 sentence natural explanation of the exact results.
-- chart_type: one of ["bar","line","pie","sunburst","none"].
-- chart_spec: an object with fields: table (e.g. "order_products__prior"), x (column name), y (column name or "count"), agg ("count"|"sum"|"avg"), top_k (integer).
-- followups: list of 0..3 short suggested follow-up queries.
+Return a JSON dictionary with:
+- "answer": one short paragraph summarizing the insight
+- "chart_type": one of ["bar","line","pie","scatter","none"]
+- "chart_spec": {
+      "x": <column_name>,
+      "y": <column_name>,
+      "agg": <aggregation like 'count' or 'sum'>,
+      "top_k": <how many items to chart>
+  }
+- "followups": list of 2–4 follow-up questions.
 
-Example:
-{{"answer_text":"...","chart_type":"bar","chart_spec":{{"table":"order_products__prior","x":"product_name","y":"product_id","agg":"count","top_k":10}},"followups":["..."]}}
-\"\"\"
+Important: **Return ONLY valid JSON.**
+"""
     return prompt
 
 def compute_chart_df_from_spec(spec, dfs):
